@@ -1086,7 +1086,12 @@ func (cli *Client) storeHistoricalPNLIDMappings(ctx context.Context, mappings []
 			PN:  pn,
 		})
 	}
-	err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs)
+	// History sync mappings come from the syncing device's own chat database,
+	// so they reflect what that device knew at some point in the past. LIDs
+	// can be remapped over time, so these pairs may be older than mappings
+	// already learned from live server sources — only use them to fill gaps,
+	// never to overwrite existing entries.
+	err := cli.Store.LIDs.PutManyLIDMappingsIfAbsent(ctx, lidPairs)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).
 			Int("pair_count", len(lidPairs)).

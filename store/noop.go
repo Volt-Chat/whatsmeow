@@ -289,6 +289,10 @@ func (n *NoopStore) PutManyLIDMappings(ctx context.Context, mappings []LIDMappin
 	return n.Error
 }
 
+func (n *NoopStore) PutManyLIDMappingsIfAbsent(ctx context.Context, mappings []LIDMapping) error {
+	return n.Error
+}
+
 func (n *NoopStore) PutLIDMapping(ctx context.Context, lid types.JID, jid types.JID) error {
 	return n.Error
 }
