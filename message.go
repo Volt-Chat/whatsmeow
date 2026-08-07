@@ -793,6 +793,9 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		if historySync.GlobalSettings != nil {
 			cli.storeGlobalSettings(ctx, historySync.GlobalSettings)
 		}
+		if historySync.CompanionMetaNonce != nil {
+			cli.storeCompanionMetaNonce(ctx, historySync.GetCompanionMetaNonce())
+		}
 	}
 	if synchronousStorage {
 		doStorage(ctx)
@@ -962,15 +965,20 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 		if chatJID.IsEmpty() {
 			continue
 		}
-		var chatPN types.JID
-		if chatJID.Server == types.DefaultUserServer {
-			chatPN = chatJID
-		} else if chatJID.Server == types.HiddenUserServer {
-			chatPN, _ = cli.Store.LIDs.GetPNForLID(ctx, chatJID)
+		var userJID types.JID
+		if chatJID.Server == types.HiddenUserServer {
+			userJID = chatJID
+		} else if chatJID.Server == types.DefaultUserServer {
+			userJID, _ = cli.Store.LIDs.GetLIDForPN(ctx, chatJID)
+			if userJID.IsEmpty() {
+				// Privacy token queries will check both LIDs and phone numbers, so while we prefer storing with LIDs,
+				// it's still better to store with the phone number than not at all.
+				userJID = chatJID
+			}
 		}
-		if !chatPN.IsEmpty() && conv.GetTcToken() != nil {
+		if !userJID.IsEmpty() && conv.GetTcToken() != nil {
 			privacyTokens = append(privacyTokens, store.PrivacyToken{
-				User:            chatPN,
+				User:            userJID,
 				Token:           conv.GetTcToken(),
 				Timestamp:       time.Unix(int64(conv.GetTcTokenTimestamp()), 0),
 				SenderTimestamp: time.Unix(int64(conv.GetTcTokenSenderTimestamp()), 0),
@@ -1076,6 +1084,20 @@ func (cli *Client) storeGlobalSettings(ctx context.Context, settings *waHistoryS
 	}
 }
 
+func (cli *Client) storeCompanionMetaNonce(ctx context.Context, nonce string) {
+	if nonce != "" && nonce != cli.Store.CompanionMetaNonce {
+		cli.Store.CompanionMetaNonce = nonce
+		err := cli.Store.Save(ctx)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).
+				Msg("Failed to save companion meta nonce")
+		} else {
+			zerolog.Ctx(ctx).Debug().
+				Msg("Saved companion meta nonce")
+		}
+	}
+}
+
 func (cli *Client) storeHistoricalPNLIDMappings(ctx context.Context, mappings []*waHistorySync.PhoneNumberToLIDMapping) {
 	lidPairs := make([]store.LIDMapping, 0, len(mappings))
 	for _, mapping := range mappings {
@@ -1103,7 +1125,12 @@ func (cli *Client) storeHistoricalPNLIDMappings(ctx context.Context, mappings []
 			PN:  pn,
 		})
 	}
-	err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs)
+	// History sync mappings come from the syncing device's own chat database,
+	// so they reflect what that device knew at some point in the past. LIDs
+	// can be remapped over time, so these pairs may be older than mappings
+	// already learned from live server sources — only use them to fill gaps,
+	// never to overwrite existing entries.
+	err := cli.Store.LIDs.PutManyLIDMappingsIfAbsent(ctx, lidPairs)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).
 			Int("pair_count", len(lidPairs)).

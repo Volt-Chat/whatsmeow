@@ -184,6 +184,7 @@ func (lm LIDMapping) GetMassInsertValues() [2]any {
 
 type LIDStore interface {
 	PutManyLIDMappings(ctx context.Context, mappings []LIDMapping) error
+	PutManyLIDMappingsIfAbsent(ctx context.Context, mappings []LIDMapping) error
 	PutLIDMapping(ctx context.Context, lid, jid types.JID) error
 	GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error)
 	GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error)
@@ -232,6 +233,7 @@ type Device struct {
 	PushName     string
 
 	LIDMigrationTimestamp int64
+	CompanionMetaNonce    string
 
 	FacebookUUID uuid.UUID
 

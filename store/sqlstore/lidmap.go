@@ -51,6 +51,11 @@ const (
 		VALUES ($1, $2)
 		ON CONFLICT (lid) DO UPDATE SET pn=excluded.pn WHERE whatsmeow_lid_map.pn<>excluded.pn
 	`
+	putLIDMappingIfAbsentQuery = `
+		INSERT INTO whatsmeow_lid_map (lid, pn)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING
+	`
 	getLIDForPNQuery       = `SELECT lid FROM whatsmeow_lid_map WHERE pn=$1`
 	getPNForLIDQuery       = `SELECT pn FROM whatsmeow_lid_map WHERE lid=$1`
 	getAllLIDMappingsQuery = `SELECT lid, pn FROM whatsmeow_lid_map`
@@ -188,7 +193,7 @@ func (s *CachedLIDMap) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (
 			lidDev := dev
 			lidDev.Server = types.HiddenUserServer
 			lidDev.User = lid
-			result[dev] = lidDev.ToNonAD()
+			result[dev] = lidDev
 		}
 	})
 	return result, err
@@ -235,6 +240,57 @@ func (s *CachedLIDMap) PutManyLIDMappings(ctx context.Context, mappings []store.
 			err := s.unlockedPutLIDMapping(ctx, mapping.LID, mapping.PN)
 			if err != nil {
 				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PutManyLIDMappingsIfAbsent stores LID-PN mappings like PutManyLIDMappings,
+// but never overwrites: a pair is only inserted if neither its LID nor its PN
+// is mapped yet. This is meant for point-in-time sources like history sync
+// payloads, which reflect what the syncing device knew at some moment in the
+// past and may therefore carry mappings older than what was already learned
+// from live server sources (usync queries, group info, notifications).
+func (s *CachedLIDMap) PutManyLIDMappingsIfAbsent(ctx context.Context, mappings []store.LIDMapping) error {
+	s.lidCacheLock.Lock()
+	defer s.lidCacheLock.Unlock()
+	mappings = slices.DeleteFunc(mappings, func(mapping store.LIDMapping) bool {
+		if mapping.LID.Server != types.HiddenUserServer || mapping.PN.Server != types.DefaultUserServer {
+			zerolog.Ctx(ctx).Debug().
+				Stringer("entry_lid", mapping.LID).
+				Stringer("entry_pn", mapping.PN).
+				Msg("Ignoring invalid entry in PutManyLIDMappingsIfAbsent")
+			return true
+		}
+		// Empty cached values are cached misses, not existing mappings.
+		if lid, ok := s.pnToLIDCache[mapping.PN.User]; ok && lid != "" {
+			return true
+		}
+		if pn, ok := s.lidToPNCache[mapping.LID.User]; ok && pn != "" {
+			return true
+		}
+		return false
+	})
+	mappings = exslices.DeduplicateUnsortedOverwrite(mappings)
+	if len(mappings) == 0 {
+		return nil
+	}
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for _, mapping := range mappings {
+			res, err := s.db.Exec(ctx, putLIDMappingIfAbsentQuery, mapping.LID.User, mapping.PN.User)
+			if err != nil {
+				return err
+			}
+			rowCount, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			// Only cache pairs that actually landed: on conflict the DB kept
+			// an existing row that may disagree with this pair.
+			if rowCount > 0 {
+				s.pnToLIDCache[mapping.PN.User] = mapping.LID.User
+				s.lidToPNCache[mapping.LID.User] = mapping.PN.User
 			}
 		}
 		return nil
