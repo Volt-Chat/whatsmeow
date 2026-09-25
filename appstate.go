@@ -45,6 +45,11 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	return cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
+}
+
+// fetchAppStateLocked is fetchAppState for callers that already hold appStateSyncLock.
+func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {
@@ -514,6 +519,16 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	if cli == nil {
 		return ErrClientIsNil
 	}
+	// A send reads the stored version and hash, encodes against them, and on a 409 applies the
+	// conflicting patches before retrying. Holding the sync lock for the whole exchange keeps a
+	// concurrent fetch or send from applying patches to the same collection in between, which
+	// otherwise corrupts the stored mutation MACs and LTHash.
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	return cli.sendAppStateLocked(ctx, patch, allowRetry)
+}
+
+func (cli *Client) sendAppStateLocked(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
 	if err != nil {
 		return err
@@ -584,12 +599,12 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 						cli.dispatchEvent(evt)
 					}
 				}()
-				return cli.sendAppState(ctx, patch, false)
+				return cli.sendAppStateLocked(ctx, patch, false)
 			}
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
