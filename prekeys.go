@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/libsignal/ecc"
 	"go.mau.fi/libsignal/keys/identity"
 	"go.mau.fi/libsignal/keys/prekey"
+	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/util/optional"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -28,6 +29,74 @@ const (
 	// MinPreKeyCount is the number of prekeys when the client will upload a new batch of prekeys to the WhatsApp servers.
 	MinPreKeyCount = 5
 )
+
+// EnsureSession establishes a missing outgoing Signal session for a device without
+// sending a message. Device zero selects the primary phone. Phone-number JIDs are
+// resolved through the stored PN-to-LID mapping; an absent mapping is an error.
+//
+// Existing sessions are left unchanged. Missing sessions require a connected
+// client to fetch prekeys and are persisted in the device store. Identity trust
+// failures are returned even when AutoTrustIdentity is enabled: this operation
+// never deletes an identity or session. Success establishes local encryption
+// state, not delivery to or acknowledgement by the remote device.
+func (cli *Client) EnsureSession(ctx context.Context, device types.JID) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	if device.User == "" || (device.Server != types.DefaultUserServer && device.Server != types.HiddenUserServer) {
+		return fmt.Errorf("unsupported session device JID: %s", device)
+	}
+	if cli.Store == nil || cli.Store.ID == nil {
+		return ErrNotLoggedIn
+	}
+	// Serialize with SendMessage and other EnsureSession calls so concurrent
+	// callers reuse the first successful setup.
+	cli.messageSendLock.Lock()
+	defer cli.messageSendLock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if device.Server == types.DefaultUserServer {
+		lid, err := cli.Store.LIDs.GetLIDForPN(ctx, device)
+		if err != nil {
+			return fmt.Errorf("failed to get LID for PN %s: %w", device, err)
+		} else if lid.IsEmpty() {
+			return fmt.Errorf("no LID mapping for PN %s", device)
+		}
+		device = lid
+	}
+	address := device.SignalAddress()
+	exists, err := cli.Store.ContainsSession(ctx, address)
+	if err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	responses, err := cli.fetchPreKeys(ctx, []types.JID{device})
+	if err != nil {
+		return err
+	}
+	response, ok := responses[device]
+	if !ok {
+		return fmt.Errorf("prekey response missing device %s", device)
+	} else if response.err != nil {
+		return fmt.Errorf("failed to fetch prekey for %s: %w", device, response.err)
+	} else if response.bundle == nil {
+		return fmt.Errorf("prekey response has no bundle for %s", device)
+	}
+	// An incoming message may have established the session during the prekey IQ.
+	exists, err = cli.Store.ContainsSession(ctx, address)
+	if err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	builder := session.NewBuilderFromSignal(cli.Store, address, pbSerializer)
+	if err = builder.ProcessBundle(ctx, response.bundle); err != nil {
+		return fmt.Errorf("failed to establish session with %s: %w", device, err)
+	}
+	return nil
+}
 
 func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
 	resp, err := cli.sendIQ(ctx, infoQuery{
