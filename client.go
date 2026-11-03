@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -86,6 +87,8 @@ type Client struct {
 	SynchronousAck             bool
 	EnableDecryptedEventBuffer bool
 	lastDecryptedBufferClear   time.Time
+	lastUnifiedSessionSend     time.Time
+	UnifiedSessionInterval     time.Duration
 
 	DisableLoginAutoReconnect bool
 
@@ -102,6 +105,7 @@ type Client struct {
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
+	appStateBackoff  map[appstate.WAPatchName]time.Time
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool
@@ -217,7 +221,22 @@ type Client struct {
 type groupMetaCache struct {
 	AddressingMode             types.AddressingMode
 	CommunityAnnouncementGroup bool
+	ReadOnly                   bool
 	Members                    []types.JID
+	Admins                     []types.JID
+}
+
+func (gmc *groupMetaCache) CanSend(sender types.JID, message *waE2E.Message) bool {
+	return gmc == nil ||
+		!gmc.ReadOnly ||
+		message.PollUpdateMessage != nil ||
+		message.ReactionMessage != nil ||
+		message.EncReactionMessage != nil ||
+		message.EncEventResponseMessage != nil ||
+		message.QuestionResponseMessage != nil ||
+		message.CommentMessage != nil ||
+		message.EncCommentMessage != nil ||
+		slices.Contains(gmc.Admins, sender.ToNonAD())
 }
 
 type MessengerConfig struct {
@@ -283,6 +302,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
+		appStateBackoff:        make(map[appstate.WAPatchName]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
 
@@ -506,8 +526,7 @@ func isRetryableConnectError(err error) bool {
 		return true
 	}
 
-	var statusErr socket.ErrWithStatusCode
-	if errors.As(err, &statusErr) {
+	if statusErr, ok := errors.AsType[socket.ErrWithStatusCode](err); ok {
 		switch statusErr.StatusCode {
 		case 408, 500, 501, 502, 503, 504:
 			return true
@@ -516,7 +535,9 @@ func isRetryableConnectError(err error) bool {
 		}
 	}
 
-	return errors.Is(err, socket.ErrDialFailed)
+	return errors.Is(err, socket.ErrDialFailed) ||
+		errors.Is(err, ErrHandshakeTimeout) ||
+		errors.Is(err, socket.ErrSocketClosed)
 }
 
 func (cli *Client) ConnectContext(ctx context.Context) error {
@@ -1091,11 +1112,14 @@ func (cli *Client) getUnifiedSessionID() string {
 	return strconv.FormatInt(unifiedID, 10)
 }
 
-func (cli *Client) sendUnifiedSession() {
+func (cli *Client) sendUnifiedSession(checkLastSend bool) {
 	if cli == nil {
 		return
 	}
-
+	if checkLastSend && time.Since(cli.lastUnifiedSessionSend) < cli.UnifiedSessionInterval {
+		return
+	}
+	cli.lastUnifiedSessionSend = time.Now()
 	node := waBinary.Node{
 		Tag:   "ib",
 		Attrs: waBinary.Attrs{},

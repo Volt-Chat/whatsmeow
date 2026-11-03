@@ -683,6 +683,8 @@ func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.Cont
 		return nil
 	}
 	origLen := len(contacts)
+	// Deduplication keeps the first entry, but the last one is the newest
+	slices.Reverse(contacts)
 	contacts = exslices.DeduplicateUnsortedOverwriteFunc(contacts, func(t store.ContactEntry) types.JID {
 		return t.JID
 	})
@@ -843,6 +845,19 @@ func (s *SQLStore) PutPinned(ctx context.Context, chat types.JID, pinned bool) e
 func (s *SQLStore) PutArchived(ctx context.Context, chat types.JID, archived bool) error {
 	_, err := s.db.Exec(ctx, fmt.Sprintf(putChatSettingQuery, "archived"), s.JID, chat, archived)
 	return err
+}
+
+func (s *SQLStore) PutWASARootSecretID(ctx context.Context, chat types.JID, id types.MessageID) error {
+	_, err := s.db.Exec(ctx, fmt.Sprintf(putChatSettingQuery, "wasa_root_secret_id"), s.JID, chat, id)
+	return err
+}
+
+func (s *SQLStore) GetWASARootSecretID(ctx context.Context, chat types.JID) (id types.MessageID, err error) {
+	err = s.db.QueryRow(ctx, `SELECT wasa_root_secret_id FROM whatsmeow_chat_settings WHERE our_jid=$1 AND chat_jid=$2`, s.JID, chat).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return
 }
 
 func (s *SQLStore) GetChatSettings(ctx context.Context, chat types.JID) (settings types.LocalChatSettings, err error) {

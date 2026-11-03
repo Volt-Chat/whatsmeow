@@ -71,6 +71,9 @@ const (
 	IndexLockMessage                     = "lock_message"
 	IndexContactManagerMetadata          = "contact_manager_metadata"
 	IndexBusinessFolderActivation        = "business_folder_activation"
+	IndexGroupHistoryToggle              = "group_history_toggle"
+	IndexBBProPendingCustomerBaseAction  = "bb_pro_pending_customer_base_action"
+	IndexCommunityNestingState           = "community_nesting_state"
 )
 
 // Constants for the regular app state indexes.
@@ -131,6 +134,8 @@ const (
 	IndexBizAISettingsNudgeAction                     = "biz_ai_settings_nudge"
 	IndexWasaRootSecretAction                         = "wasa_root_secret"
 	IndexSharedDeviceAllowlist                        = "shared_device_allowlist"
+	IndexSharedDeviceSecret                           = "shared_device_secret"
+	IndexHatchCVMSecret                               = "hatch_cvm_secret"
 )
 
 // Constants for the critical_unblock_low app state indexes.
