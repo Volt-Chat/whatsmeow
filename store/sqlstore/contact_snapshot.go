@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"go.mau.fi/util/dbutil"
+
 	"go.mau.fi/whatsmeow/store"
 )
 
