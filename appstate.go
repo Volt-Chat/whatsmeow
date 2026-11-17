@@ -144,14 +144,15 @@ func (cli *Client) handleAppStateRecovery(
 		return true
 	}
 	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
-	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
+	err = cli.withContactSnapshot(ctx, name, true, func(txCtx context.Context) error {
+		mutations, processErr := cli.appStateProc.ProcessRecovery(txCtx, snapshot)
+		if processErr != nil {
+			return processErr
+		}
+		return cli.collectEventsToDispatch(txCtx, name, mutations, true, eventsToDispatchPtr)
+	})
 	if err != nil {
-		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
-		return true
-	}
-	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
-	if err != nil {
-		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
+		cli.Log.Warnf("Failed to apply app state recovery for %s: %v", reqID, err)
 		return true
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
@@ -173,16 +174,51 @@ func (cli *Client) applyAppStatePatches(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) (appstate.HashState, error) {
-	mutations, newState, err := cli.appStateProc.DecodePatches(ctx, patches, state, true)
-	if err != nil {
-		if errors.Is(err, appstate.ErrKeyNotFound) {
+	var newState appstate.HashState
+	var decodeErr error
+	var stagedEvents []any
+	var stagedTarget *[]any
+	if eventsToDispatch != nil {
+		stagedTarget = &stagedEvents
+	}
+	err := cli.withContactSnapshot(ctx, name, fullSync, func(txCtx context.Context) error {
+		var mutations []appstate.Mutation
+		mutations, newState, decodeErr = cli.appStateProc.DecodePatches(txCtx, patches, state, true)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		return cli.collectEventsToDispatch(txCtx, name, mutations, fullSync, stagedTarget)
+	})
+	if decodeErr != nil {
+		if errors.Is(decodeErr, appstate.ErrKeyNotFound) {
 			go cli.requestMissingAppStateKeys(context.WithoutCancel(ctx), patches)
 		} else {
-			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
+			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: decodeErr})
 		}
-		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
+		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, decodeErr)
 	}
-	return newState, cli.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
+	if err != nil {
+		return state, err
+	}
+	if eventsToDispatch != nil {
+		*eventsToDispatch = append(*eventsToDispatch, stagedEvents...)
+	}
+	return newState, nil
+}
+
+// The SQL store can commit contact names and the sync cursor together. Other
+// collections and custom stores retain their existing persistence behavior.
+type contactSnapshotTransaction interface {
+	WithContactSnapshotTransaction(context.Context, store.ContactStore, func(context.Context) error) error
+}
+
+func (cli *Client) withContactSnapshot(ctx context.Context, name appstate.WAPatchName, fullSync bool, apply func(context.Context) error) error {
+	if name == appstate.WAPatchCriticalUnblockLow && fullSync {
+		if transactionStore, ok := cli.Store.AppState.(contactSnapshotTransaction); ok {
+			return transactionStore.WithContactSnapshotTransaction(ctx, cli.Store.Contacts, apply)
+		}
+	}
+	return apply(ctx)
 }
 
 func (cli *Client) collectEventsToDispatch(
@@ -192,21 +228,22 @@ func (cli *Client) collectEventsToDispatch(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) error {
-	if name == appstate.WAPatchCriticalUnblockLow && fullSync && !cli.EmitAppStateEventsOnFullSync {
-		var contacts []store.ContactEntry
-		mutations, contacts = cli.filterContacts(mutations)
+	contactsStored := name == appstate.WAPatchCriticalUnblockLow && fullSync && cli.Store.Contacts != nil
+	if contactsStored {
+		// filterContacts compacts its input. Preserve mutation order for events.
+		_, contacts := cli.filterContacts(append([]appstate.Mutation(nil), mutations...))
 		cli.Log.Debugf("Mass inserting app state snapshot with %d contacts into the store", len(contacts))
 		err := cli.Store.Contacts.PutAllContactNames(ctx, contacts)
 		if err != nil {
 			// This is a fairly serious failure, so just abort the whole thing
-			return fmt.Errorf("failed to update contact store with data from snapshot: %v", err)
+			return fmt.Errorf("failed to update contact store with data from snapshot: %w", err)
 		}
 	}
 	for _, mutation := range mutations {
 		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}
-		evt := cli.dispatchAppState(ctx, name, mutation, fullSync)
+		evt := cli.dispatchAppStateWithStoredContacts(ctx, name, mutation, fullSync, contactsStored)
 		if eventsToDispatch != nil && evt != nil {
 			*eventsToDispatch = append(*eventsToDispatch, evt)
 		}
@@ -218,7 +255,7 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 	filteredMutations := mutations[:0]
 	contacts := make([]store.ContactEntry, 0, len(mutations))
 	for _, mutation := range mutations {
-		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
+		if len(mutation.Index) > 1 && mutation.Index[0] == appstate.IndexContact {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
 			contacts = append(contacts, store.ContactEntry{
@@ -234,6 +271,10 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 }
 
 func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchName, mutation appstate.Mutation, fullSync bool) (eventToDispatch any) {
+	return cli.dispatchAppStateWithStoredContacts(ctx, name, mutation, fullSync, false)
+}
+
+func (cli *Client) dispatchAppStateWithStoredContacts(ctx context.Context, name appstate.WAPatchName, mutation appstate.Mutation, fullSync, contactsStored bool) (eventToDispatch any) {
 	logLevel := zerolog.TraceLevel
 	log := zerolog.Ctx(ctx)
 	if cli.AppStateDebugLogs && log.GetLevel() != zerolog.TraceLevel {
@@ -306,7 +347,7 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
-		if cli.Store.Contacts != nil {
+		if cli.Store.Contacts != nil && !contactsStored {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
 		}
 	case appstate.IndexClearChat:
