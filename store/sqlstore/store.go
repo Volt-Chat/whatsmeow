@@ -704,6 +704,11 @@ func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.Cont
 	if err != nil {
 		return err
 	}
+	if ctx.Value(contactSnapshotContextKey{}) == s {
+		// The outer transaction clears the cache after releasing database row
+		// locks. Taking the cache mutex now could deadlock with a push-name write.
+		return nil
+	}
 	s.contactCacheLock.Lock()
 	// Just clear the cache, fetching pushnames and business names would be too much effort
 	s.contactCache = make(map[types.JID]*types.ContactInfo)
