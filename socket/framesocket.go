@@ -64,6 +64,12 @@ func (fs *FrameSocket) IsConnected() bool {
 	return fs.conn.Load() != nil
 }
 
+func (fs *FrameSocket) setOnDisconnect(callback func(context.Context, bool)) {
+	fs.lock.Lock()
+	fs.OnDisconnect = callback
+	fs.lock.Unlock()
+}
+
 func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	fs.lock.Lock()
 	defer fs.lock.Unlock()
@@ -87,8 +93,8 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	}
 	fs.cancel()
 	fs.cancel = nil
-	if fs.OnDisconnect != nil {
-		go fs.OnDisconnect(fs.parentCtx, code == 0)
+	if callback := fs.OnDisconnect; callback != nil {
+		go callback(fs.parentCtx, code == 0)
 	}
 }
 
