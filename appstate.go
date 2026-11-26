@@ -307,7 +307,7 @@ func (cli *Client) dispatchAppStateWithStoredContacts(ctx context.Context, name 
 	}
 
 	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
-	if (mutation.Action != nil && mutation.Action.ContactAction == nil) && mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
+	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
 
