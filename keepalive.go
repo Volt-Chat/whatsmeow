@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -45,9 +46,7 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 				})
 				if cli.EnableAutoReconnect && time.Since(lastSuccess) > KeepAliveMaxFailTime {
 					cli.Log.Debugf("Forcing reconnect due to keepalive failure")
-					cli.Disconnect()
-					cli.resetExpectedDisconnect()
-					go cli.autoReconnect(ctx)
+					cli.ResetConnection()
 				}
 			} else {
 				if errorCount > 0 {
@@ -63,10 +62,13 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 }
 
 func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
+	id := cli.generateRequestID()
+	cli.lastKeepAliveID.Store(&id)
 	respCh, err := cli.sendIQAsync(ctx, infoQuery{
 		Namespace: "w:p",
 		Type:      "get",
 		To:        types.ServerJID,
+		ID:        id,
 	})
 	if ctx.Err() != nil {
 		return false, false
@@ -84,4 +86,12 @@ func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue
 	case <-ctx.Done():
 		return false, false
 	}
+}
+
+func (cli *Client) isKeepAliveNode(node *waBinary.Node) bool {
+	if node.Tag != "iq" || node.Content != nil {
+		return false
+	}
+	id := cli.lastKeepAliveID.Load()
+	return id != nil && node.Attrs["id"] == *id
 }
