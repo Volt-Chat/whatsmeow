@@ -306,7 +306,8 @@ func (cli *Client) dispatchAppStateWithStoredContacts(ctx context.Context, name 
 		return
 	}
 
-	if (mutation.Action != nil && mutation.Action.ContactAction == nil) && mutation.Operation != waServerSync.SyncdMutation_SET {
+	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
+	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
 
@@ -346,6 +347,9 @@ func (cli *Client) dispatchAppStateWithStoredContacts(ctx context.Context, name 
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if isContactRemove {
+			act = nil
+		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil && !contactsStored {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())

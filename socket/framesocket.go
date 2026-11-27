@@ -31,12 +31,11 @@ type FrameSocket struct {
 	HTTPHeaders http.Header
 	HTTPClient  *http.Client
 
-	Frames       chan []byte
-	OnDisconnect func(ctx context.Context, remote bool)
-
+	Frames chan []byte
 	Header []byte
 
-	closed atomic.Bool
+	onDisconnect atomic.Pointer[func(ctx context.Context, remote bool)]
+	closed       atomic.Bool
 
 	incomingLength int
 	receivedLength int
@@ -64,12 +63,6 @@ func (fs *FrameSocket) IsConnected() bool {
 	return fs.conn.Load() != nil
 }
 
-func (fs *FrameSocket) setOnDisconnect(callback func(context.Context, bool)) {
-	fs.lock.Lock()
-	fs.OnDisconnect = callback
-	fs.lock.Unlock()
-}
-
 func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	fs.lock.Lock()
 	defer fs.lock.Unlock()
@@ -93,8 +86,8 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	}
 	fs.cancel()
 	fs.cancel = nil
-	if callback := fs.OnDisconnect; callback != nil {
-		go callback(fs.parentCtx, code == 0)
+	if onDisconnect := fs.onDisconnect.Swap(nil); onDisconnect != nil {
+		go (*onDisconnect)(fs.parentCtx, code == 0)
 	}
 }
 
@@ -166,7 +159,10 @@ func (fs *FrameSocket) frameComplete() {
 	fs.partialHeader = nil
 	fs.incomingLength = 0
 	fs.receivedLength = 0
-	fs.Frames <- data
+	select {
+	case fs.Frames <- data:
+	case <-fs.cancelCtx.Done():
+	}
 }
 
 func (fs *FrameSocket) processData(msg []byte) {
